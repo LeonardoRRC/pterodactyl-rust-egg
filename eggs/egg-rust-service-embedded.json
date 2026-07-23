@@ -4,13 +4,13 @@
         "version": "PTDL_v2",
         "update_url": null
     },
-    "exported_at": "2026-07-23T01:28:27+00:00",
+    "exported_at": "2026-07-23T01:42:10+00:00",
     "name": "Rust Service (Cargo + Cloudflare Tunnel)",
     "author": "quantum@thequantum.uk",
     "description": "Host and build services written in Rust. Syncs the source from Git, manages the toolchain with rustup, builds with cargo (configurable profile, features, target and flags), allows a fully custom startup command, and ships a Cloudflare Tunnel reverse proxy with three modes: temporary URL, dashboard token, or interactive login that creates the tunnel, the DNS record and the access token.",
     "features": null,
     "docker_images": {
-        "Rust - custom image (recommended)": "ghcr.io/LeonardoRRC/pterodactyl-rust-service:latest",
+        "Rust - custom image (recommended)": "ghcr.io/CHANGE_ME/pterodactyl-rust-service:latest",
         "Rust latest (yolks)": "ghcr.io/parkervcp/yolks:rust_latest",
         "Rust 1.85 (yolks)": "ghcr.io/parkervcp/yolks:rust_1.85",
         "Debian (run pre-compiled binaries only)": "ghcr.io/parkervcp/yolks:debian"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, pathlib, datetime
+import json, os, pathlib, datetime
 
 BASE = pathlib.Path(__file__).resolve().parent.parent
 S = BASE / "runtime"
@@ -18,15 +18,64 @@ assert "@@" not in tpl, "unsubstituted placeholders left"
 
 
 OUT = BASE / "eggs"
+EMBEDDED = OUT / "egg-rust-service-embedded.json"
+REMOTE = OUT / "egg-rust-service-remote.json"
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+PREV = load(EMBEDDED)
+PREV_REMOTE = load(REMOTE)
+CONFIG = load(BASE / "tools" / "egg.config.json")
 
 
 def exported_at(path):
     """Keep the previous timestamp so rebuilding is deterministic and CI can
     diff the generated eggs against the committed ones."""
-    try:
-        return json.loads(path.read_text())["exported_at"]
-    except Exception:
-        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+    prev = load(path).get("exported_at")
+    return prev or datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def setting(key, env_var, default, from_egg=None):
+    """Resolve a deployment-specific value. Precedence:
+    1. environment variable        (handy for CI)
+    2. tools/egg.config.json
+    3. the value already committed in eggs/*.json  (manual edits survive)
+    4. the built-in default
+    Without this, running the builder would silently revert your own author,
+    image names or RUNTIME_URL on every rebuild."""
+    get = from_egg or (lambda egg: egg.get(key))
+    for candidate in (
+        os.environ.get(env_var) if env_var else None,
+        CONFIG.get(key),
+        get(PREV),
+        get(PREV_REMOTE),
+    ):
+        if candidate:
+            return candidate
+    return default
+
+
+AUTHOR = setting("author", "EGG_AUTHOR", "admin@example.com")
+
+DOCKER_IMAGES = setting("docker_images", None, {
+    "Rust - custom image (recommended)": "ghcr.io/CHANGE_ME/pterodactyl-rust-service:latest",
+    "Rust latest (yolks)": "ghcr.io/parkervcp/yolks:rust_latest",
+    "Rust 1.85 (yolks)": "ghcr.io/parkervcp/yolks:rust_1.85",
+    "Debian (run pre-compiled binaries only)": "ghcr.io/parkervcp/yolks:debian",
+})
+
+
+def _runtime_url_from(egg):
+    for v in egg.get("variables", []):
+        if v.get("env_variable") == "RUNTIME_URL":
+            return v.get("default_value")
+    return None
 
 
 def var(name, desc, env, default, rules, editable=True, viewable=True):
@@ -132,7 +181,11 @@ variables = [
         "CF_PROTOCOL", "auto", "required|in:auto,http2,quic"),
 ]
 
-RUNTIME_URL_DEFAULT = "https://raw.githubusercontent.com/LeonardoRRC/pterodactyl-rust-service/main/runtime"
+RUNTIME_URL_DEFAULT = setting(
+    "runtime_url", "RUNTIME_URL",
+    "https://raw.githubusercontent.com/CHANGE_ME/pterodactyl-rust-service/main/runtime",
+    from_egg=_runtime_url_from,
+)
 
 remote_var = var(
     "Runtime source URL",
@@ -146,7 +199,7 @@ egg = {
     "meta": {"version": "PTDL_v2", "update_url": None},
     "exported_at": exported_at(OUT / "egg-rust-service-embedded.json"),
     "name": "Rust Service (Cargo + Cloudflare Tunnel)",
-    "author": "admin@example.com",
+    "author": AUTHOR,
     "description": (
         "Host and build services written in Rust. Syncs the source from Git, manages the toolchain with "
         "rustup, builds with cargo (configurable profile, features, target and flags), allows a fully custom "
@@ -154,12 +207,7 @@ egg = {
         "dashboard token, or interactive login that creates the tunnel, the DNS record and the access token."
     ),
     "features": None,
-    "docker_images": {
-        "Rust - custom image (recommended)": "ghcr.io/LeonardoRRC/pterodactyl-rust-service:latest",
-        "Rust latest (yolks)": "ghcr.io/parkervcp/yolks:rust_latest",
-        "Rust 1.85 (yolks)": "ghcr.io/parkervcp/yolks:rust_1.85",
-        "Debian (run pre-compiled binaries only)": "ghcr.io/parkervcp/yolks:debian",
-    },
+    "docker_images": DOCKER_IMAGES,
     "file_denylist": [],
     "startup": "bash .pxsvc/entrypoint.sh",
     "config": {

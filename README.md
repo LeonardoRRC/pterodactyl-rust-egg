@@ -16,6 +16,66 @@ tools/build-eggs.py                <- regenerates both eggs from runtime/
 
 ---
 
+## 0. Publishing this repository
+
+```bash
+git init -b main
+git add .
+git commit -m "Rust service egg for Pterodactyl"
+git remote add origin https://github.com/YOUR_USER/pterodactyl-rust-service.git
+git push -u origin main
+```
+
+Then set your own values. Three of them belong in `tools/egg.config.json`, **not** in the
+eggs themselves — `tools/build-eggs.py` regenerates `eggs/*.json`, so anything you type
+directly into those files gets reverted on the next build and CI fails:
+
+```json
+{
+    "author": "you@example.com",
+    "docker_images": {
+        "Rust - custom image (recommended)": "ghcr.io/YOUR_USER/pterodactyl-rust-service:latest",
+        "Rust latest (yolks)": "ghcr.io/parkervcp/yolks:rust_latest",
+        "Debian (run pre-compiled binaries only)": "ghcr.io/parkervcp/yolks:debian"
+    },
+    "runtime_url": "https://raw.githubusercontent.com/YOUR_USER/pterodactyl-rust-service/main/runtime"
+}
+```
+
+Then `python3 tools/build-eggs.py` and commit. Resolution order for these three values:
+
+1. environment variables (`EGG_AUTHOR`, `RUNTIME_URL`) — useful in CI,
+2. `tools/egg.config.json`,
+3. whatever is already committed in `eggs/*.json` — so an existing manual edit survives,
+4. the built-in placeholder.
+
+`LICENSE` still needs its copyright holder replaced by hand.
+
+`git push` triggers **Build and publish image**, which builds `docker/Dockerfile` for
+amd64 and arm64 and pushes it to `ghcr.io/YOUR_USER/pterodactyl-rust-service:latest`.
+No secrets to configure: it uses the automatic `GITHUB_TOKEN`.
+
+> **The first push publishes a private package.** Wings cannot pull it until you go to
+> your profile → **Packages** → `pterodactyl-rust-service` → **Package settings** →
+> **Change visibility → Public**. Do this once; a private image fails with
+> `manifest unknown` or `unauthorized` on the node.
+
+Tag a release to pin a version: `git tag v1.0.0 && git push --tags` produces the
+`:v1.0.0` tag alongside `:latest`.
+
+The **Validate eggs and runtime** workflow checks the shell syntax of every script,
+verifies the `done` marker still exists in the runtime, and fails if `eggs/` is out of
+date with respect to `runtime/`.
+
+### After editing anything in `runtime/`
+
+```bash
+python3 tools/build-eggs.py   # re-embeds the scripts into eggs/*.json
+git commit -am "runtime: ..." && git push
+```
+
+---
+
 ## 1. Which egg to import
 
 | | `embedded` | `remote` |

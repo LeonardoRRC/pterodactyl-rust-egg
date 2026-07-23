@@ -17,7 +17,7 @@ cd /mnt/server || exit 1
 # ---------------------------------------------------------------------
 # 1. Runtime scripts (downloaded)
 # ---------------------------------------------------------------------
-RUNTIME_URL="${RUNTIME_URL:-https://raw.githubusercontent.com/LeonardoRRC/pterodactyl-rust-service/main/runtime}"
+RUNTIME_URL="${RUNTIME_URL:-https://raw.githubusercontent.com/CHANGE_ME/pterodactyl-rust-service/main/runtime}"
 RUNTIME_URL="${RUNTIME_URL%/}"
 
 echo "==> Downloading the pxsvc runtime"

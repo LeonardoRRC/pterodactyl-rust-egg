@@ -50,8 +50,11 @@ jobs:
       - name: Eggs must be in sync with runtime/
         run: |
           python3 tools/build-eggs.py
-          git diff --exit-code eggs/ \
-            || { echo "::error::eggs/ is out of date - run 'python3 tools/build-eggs.py' and commit the result"; exit 1; }
+          git diff --exit-code eggs/ || {
+            echo "::error::eggs/ is out of date - run 'python3 tools/build-eggs.py' and commit the result."
+            echo "::notice::If the diff only touches author / docker_images / RUNTIME_URL, do not hand-edit the eggs: set them in tools/egg.config.json instead."
+            exit 1
+          }
 
       - name: Shellcheck
         run: |
