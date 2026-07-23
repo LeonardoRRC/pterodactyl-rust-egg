@@ -1,0 +1,295 @@
+{
+    "_comment": "Rust Service Egg - pxsvc runtime (git + cargo + Cloudflare Tunnel). Built for Pterodactyl / Pelican.",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-07-23T01:28:27+00:00",
+    "name": "Rust Service (Cargo + Cloudflare Tunnel)",
+    "author": "quantum@thequantum.uk",
+    "description": "Host and build services written in Rust. Syncs the source from Git, manages the toolchain with rustup, builds with cargo (configurable profile, features, target and flags), allows a fully custom startup command, and ships a Cloudflare Tunnel reverse proxy with three modes: temporary URL, dashboard token, or interactive login that creates the tunnel, the DNS record and the access token.",
+    "features": null,
+    "docker_images": {
+        "Rust - custom image (recommended)": "ghcr.io/LeonardoRRC/pterodactyl-rust-service:latest",
+        "Rust latest (yolks)": "ghcr.io/parkervcp/yolks:rust_latest",
+        "Rust 1.85 (yolks)": "ghcr.io/parkervcp/yolks:rust_1.85",
+        "Debian (run pre-compiled binaries only)": "ghcr.io/parkervcp/yolks:debian"
+    },
+    "file_denylist": [],
+    "startup": "bash .pxsvc/entrypoint.sh",
+    "config": {
+        "files": "{}",
+        "startup": "{\"done\": [\"[pxsvc] service is running\"], \"strip_ansi\": false}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\n# =====================================================================\n#  Rust Service · Pterodactyl install script\n#  Container: ghcr.io/parkervcp/installers:debian\n#  Do NOT run this on the host: Wings executes it inside a container.\n# =====================================================================\n\napt-get update -y >/dev/null 2>&1\napt-get install -y --no-install-recommends \\\n    ca-certificates curl wget git jq tar unzip xz-utils file >/dev/null 2>&1\n\nexport HOME=/mnt/server\nmkdir -p /mnt/server/.pxsvc/bin /mnt/server/.pxsvc/lib /mnt/server/.pxsvc/logs\ncd /mnt/server || exit 1\n\necho \"==> Installing the pxsvc runtime into /mnt/server/.pxsvc\"\n\n# ---------------------------------------------------------------------\n# 1. Runtime scripts\n# ---------------------------------------------------------------------\ncat > /mnt/server/.pxsvc/entrypoint.sh <<'PXSVC_EOF_ENTRYPOINT'\n#!/bin/bash\n# ============================================================\n#  pxsvc :: entrypoint.sh\n#  Runtime for Rust services on Pterodactyl\n#  Flow: env -> git -> toolchain -> cargo build -> tunnel -> run\n# ============================================================\nset -o pipefail\n\nexport PXSVC_DIR=\"/home/container/.pxsvc\"\ncd /home/container || exit 1\n\nfor _lib in common git rust cloudflare; do\n    # shellcheck source=/dev/null\n    [ -f \"${PXSVC_DIR}/lib/${_lib}.sh\" ] && . \"${PXSVC_DIR}/lib/${_lib}.sh\"\ndone\n\nif ! command -v pxsvc_log >/dev/null 2>&1; then\n    echo \"[pxsvc] ERROR: libraries missing from ${PXSVC_DIR}/lib. Reinstall the server.\"\n    exit 1\nfi\n\npxsvc_env_setup\npxsvc_banner\npxsvc_git_sync\npxsvc_ensure_toolchain\npxsvc_build\npxsvc_cf_start\npxsvc_run\nPXSVC_EOF_ENTRYPOINT\n\ncat > /mnt/server/.pxsvc/lib/common.sh <<'PXSVC_EOF_COMMON'\n#!/bin/bash\n# ============================================================\n#  pxsvc :: common.sh  ·  shared helpers\n# ============================================================\n\nC_RESET='\\033[0m'; C_B='\\033[1m'; C_DIM='\\033[2m'\nC_BLUE='\\033[38;5;39m'; C_GREEN='\\033[38;5;42m'\nC_YELLOW='\\033[38;5;220m'; C_RED='\\033[38;5;203m'; C_PURPLE='\\033[38;5;141m'\n\npxsvc_log()  { echo -e \"${C_BLUE}[pxsvc]${C_RESET} $*\"; }\npxsvc_ok()   { echo -e \"${C_GREEN}[pxsvc]${C_RESET} $*\"; }\npxsvc_warn() { echo -e \"${C_YELLOW}[pxsvc]${C_RESET} $*\"; }\npxsvc_err()  { echo -e \"${C_RED}[pxsvc]${C_RESET} $*\"; }\npxsvc_step() { echo -e \"\\n${C_PURPLE}==>${C_RESET} ${C_B}$*${C_RESET}\"; }\npxsvc_die()  { pxsvc_err \"$*\"; exit 1; }\n\n# Treats 1/true/yes/on/enabled as true\npxsvc_bool() {\n    case \"$(echo \"${1:-0}\" | tr '[:upper:]' '[:lower:]')\" in\n        1|true|yes|on|enabled) return 0 ;;\n        *) return 1 ;;\n    esac\n}\n\npxsvc_env_setup() {\n    export HOME=\"/home/container\"\n    export USER=\"${USER:-container}\"\n    export CARGO_HOME=\"${CARGO_HOME:-/home/container/.cargo}\"\n    export RUSTUP_HOME=\"${RUSTUP_HOME:-/home/container/.rustup}\"\n    export PATH=\"${CARGO_HOME}/bin:${PXSVC_DIR}/bin:${PATH}\"\n    export CARGO_TERM_COLOR=\"${CARGO_TERM_COLOR:-always}\"\n    export RUST_LOG=\"${RUST_LOG:-info}\"\n    export RUST_BACKTRACE=\"${RUST_BACKTRACE:-0}\"\n    export GIT_TERMINAL_PROMPT=0\n\n    if [ -z \"${INTERNAL_IP}\" ]; then\n        INTERNAL_IP=\"$(ip route get 1 2>/dev/null | awk '{print $(NF-2); exit}')\"\n        export INTERNAL_IP\n    fi\n\n    # Handy shortcuts for use inside APP_ARGS / CUSTOM_STARTUP\n    export BIND_ADDR=\"0.0.0.0:${SERVER_PORT}\"\n    export PORT=\"${SERVER_PORT}\"\n\n    mkdir -p \"${PXSVC_DIR}/logs\" \"${PXSVC_DIR}/bin\"\n\n    # User-defined extra variables: KEY=VALUE pairs separated by ';'\n    if [ -n \"${ENV_VARS}\" ]; then\n        local _pair _key _val\n        while IFS= read -r _pair; do\n            _pair=\"$(echo \"${_pair}\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')\"\n            [ -z \"${_pair}\" ] && continue\n            case \"${_pair}\" in \\#*) continue ;; esac\n            case \"${_pair}\" in *=*) ;; *) continue ;; esac\n            _key=\"${_pair%%=*}\"\n            _val=\"${_pair#*=}\"\n            export \"${_key}=${_val}\"\n        done < <(echo \"${ENV_VARS}\" | tr ';' '\\n')\n    fi\n}\n\npxsvc_banner() {\n    echo -e \"${C_PURPLE}\"\n    echo \"  ┌──────────────────────────────────────────────┐\"\n    echo \"  │   RUST SERVICE RUNTIME  ·  Pterodactyl Egg    │\"\n    echo \"  └──────────────────────────────────────────────┘\"\n    echo -e \"${C_RESET}\"\n    echo -e \"  ${C_DIM}Repository :${C_RESET} ${GIT_REPO:-(local source)}\"\n    echo -e \"  ${C_DIM}Branch     :${C_RESET} ${GIT_BRANCH:-main}\"\n    echo -e \"  ${C_DIM}Toolchain  :${C_RESET} ${RUST_TOOLCHAIN:-default}${RUST_TARGET:+ (${RUST_TARGET})}\"\n    echo -e \"  ${C_DIM}Profile    :${C_RESET} ${BUILD_PROFILE:-release}\"\n    echo -e \"  ${C_DIM}Build      :${C_RESET} $(pxsvc_bool \"${BUILD_ON_BOOT}\" && echo 'yes' || echo 'no')\"\n    echo -e \"  ${C_DIM}Port       :${C_RESET} ${SERVER_PORT}  (BIND_ADDR=${BIND_ADDR})\"\n    echo -e \"  ${C_DIM}CF tunnel  :${C_RESET} $(pxsvc_bool \"${CF_ENABLED}\" && echo \"${CF_MODE:-off}\" || echo 'disabled')\"\n    echo \"\"\n}\n\n# Locates the compiled binary. Exports PXSVC_BIN on success.\npxsvc_resolve_binary() {\n    local base=\"target\"\n    [ -n \"${RUST_TARGET}\" ] && base=\"target/${RUST_TARGET}\"\n    local dir=\"${base}/release\"\n    [ \"${BUILD_PROFILE}\" = \"debug\" ] && dir=\"${base}/debug\"\n\n    local name=\"${BINARY_NAME}\"\n    [ -z \"${name}\" ] && name=\"${CARGO_BIN}\"\n    if [ -z \"${name}\" ] && [ -f Cargo.toml ]; then\n        name=\"$(grep -m1 -E '^\\s*name\\s*=' Cargo.toml | sed -E 's/.*=\\s*\"([^\"]+)\".*/\\1/')\"\n    fi\n\n    if [ -n \"${name}\" ] && [ -x \"${dir}/${name}\" ]; then\n        export PXSVC_BIN=\"${dir}/${name}\"\n        return 0\n    fi\n\n    # Last resort: first executable in the output directory\n    local found\n    found=\"$(find \"${dir}\" -maxdepth 1 -type f -executable ! -name '*.d' ! -name '*.so' 2>/dev/null | head -n1)\"\n    if [ -n \"${found}\" ]; then\n        export PXSVC_BIN=\"${found}\"\n        pxsvc_warn \"Binary auto-detected: ${PXSVC_BIN}\"\n        return 0\n    fi\n\n    unset PXSVC_BIN\n    return 1\n}\n\npxsvc_run() {\n    local cmd\n    pxsvc_resolve_binary >/dev/null 2>&1\n\n    if [ -n \"${CUSTOM_STARTUP}\" ]; then\n        cmd=\"${CUSTOM_STARTUP}\"\n    else\n        [ -n \"${PXSVC_BIN}\" ] || pxsvc_die \"Binary not found. Set BINARY_NAME/CARGO_BIN, enable BUILD_ON_BOOT, or use CUSTOM_STARTUP.\"\n        cmd=\"\\\"${PXSVC_BIN}\\\" ${APP_ARGS}\"\n    fi\n\n    pxsvc_step \"Starting service\"\n    echo -e \"${C_DIM}container@pterodactyl:~$ ${cmd}${C_RESET}\"\n    echo \"[pxsvc] service is running\"\n    exec bash -c \"${cmd}\"\n}\nPXSVC_EOF_COMMON\n\ncat > /mnt/server/.pxsvc/lib/git.sh <<'PXSVC_EOF_GIT'\n#!/bin/bash\n# ============================================================\n#  pxsvc :: git.sh  ·  source code synchronization\n# ============================================================\n\npxsvc_git_auth_url() {\n    local url=\"$1\"\n    if [ -n \"${GIT_USER}\" ] && [ -n \"${GIT_TOKEN}\" ]; then\n        echo \"${url}\" | sed -E \"s#^(https?://)#\\1${GIT_USER}:${GIT_TOKEN}@#\"\n    elif [ -n \"${GIT_TOKEN}\" ]; then\n        echo \"${url}\" | sed -E \"s#^(https?://)#\\1oauth2:${GIT_TOKEN}@#\"\n    else\n        echo \"${url}\"\n    fi\n}\n\npxsvc_git_sync() {\n    if [ -z \"${GIT_REPO}\" ]; then\n        pxsvc_log \"GIT_REPO is empty: using the code already present in /home/container\"\n        return 0\n    fi\n    if ! command -v git >/dev/null 2>&1; then\n        pxsvc_warn \"git is not available in this image; skipping synchronization\"\n        return 0\n    fi\n\n    pxsvc_step \"Synchronizing source code\"\n    local branch=\"${GIT_BRANCH:-main}\"\n    local auth_url\n    auth_url=\"$(pxsvc_git_auth_url \"${GIT_REPO}\")\"\n\n    git config --global --add safe.directory /home/container >/dev/null 2>&1\n\n    if [ ! -d .git ]; then\n        pxsvc_log \"Initializing repository from ${GIT_REPO} (branch ${branch})\"\n        git init -q .\n        git remote add origin \"${auth_url}\" 2>/dev/null || git remote set-url origin \"${auth_url}\"\n        if ! git fetch --depth 1 origin \"${branch}\"; then\n            git remote set-url origin \"${GIT_REPO}\"\n            pxsvc_die \"Could not clone the repository (wrong URL, branch or token?)\"\n        fi\n        git checkout -f -B \"${branch}\" FETCH_HEAD >/dev/null 2>&1\n    elif pxsvc_bool \"${AUTO_UPDATE}\"; then\n        pxsvc_log \"Updating to origin/${branch}\"\n        git remote set-url origin \"${auth_url}\"\n        if git fetch --depth 1 origin \"${branch}\"; then\n            git checkout -f -B \"${branch}\" FETCH_HEAD >/dev/null 2>&1\n        else\n            pxsvc_warn \"Update failed; continuing with the local copy\"\n        fi\n    else\n        pxsvc_log \"AUTO_UPDATE disabled: using the local copy\"\n    fi\n\n    # Never leave the token stored in .git/config\n    git remote set-url origin \"${GIT_REPO}\" 2>/dev/null\n\n    if [ -f .gitmodules ]; then\n        pxsvc_log \"Updating submodules\"\n        git submodule update --init --recursive --depth 1 >/dev/null 2>&1 || pxsvc_warn \"Submodules: partial failure\"\n    fi\n\n    pxsvc_ok \"HEAD → $(git log -1 --pretty='%h · %s' 2>/dev/null || echo 'unknown')\"\n}\nPXSVC_EOF_GIT\n\ncat > /mnt/server/.pxsvc/lib/rust.sh <<'PXSVC_EOF_RUST'\n#!/bin/bash\n# ============================================================\n#  pxsvc :: rust.sh  ·  toolchain and compilation\n# ============================================================\n\npxsvc_ensure_toolchain() {\n    pxsvc_step \"Preparing the Rust toolchain\"\n\n    if ! command -v cargo >/dev/null 2>&1; then\n        pxsvc_warn \"cargo is not in the image; installing rustup into /home/container (this may take several minutes)\"\n        if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\\n             | sh -s -- -y --no-modify-path --profile minimal \\\n                       --default-toolchain \"${RUST_TOOLCHAIN:-stable}\"; then\n            pxsvc_die \"Could not install rustup. Use a Docker image that ships with Rust.\"\n        fi\n        export PATH=\"${CARGO_HOME}/bin:${PATH}\"\n    fi\n\n    if command -v rustup >/dev/null 2>&1 \\\n       && [ -n \"${RUST_TOOLCHAIN}\" ] && [ \"${RUST_TOOLCHAIN}\" != \"default\" ]; then\n        if ! rustup toolchain list 2>/dev/null | grep -q \"^${RUST_TOOLCHAIN}\"; then\n            pxsvc_log \"Installing toolchain ${RUST_TOOLCHAIN}\"\n            rustup toolchain install \"${RUST_TOOLCHAIN}\" --profile minimal \\\n                || pxsvc_warn \"Could not install ${RUST_TOOLCHAIN}; falling back to the default toolchain\"\n        fi\n        rustup default \"${RUST_TOOLCHAIN}\" >/dev/null 2>&1\n    fi\n\n    if [ -n \"${RUST_TARGET}\" ] && command -v rustup >/dev/null 2>&1; then\n        pxsvc_log \"Adding target ${RUST_TARGET}\"\n        rustup target add \"${RUST_TARGET}\" >/dev/null 2>&1 \\\n            || pxsvc_warn \"Could not add target ${RUST_TARGET}\"\n    fi\n\n    command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \\\n        || pxsvc_warn \"No linker (cc/gcc) in this image: the build will fail. Use an image with build-essential or set BUILD_ON_BOOT=0.\"\n\n    [ -f rust-toolchain.toml ] || [ -f rust-toolchain ] \\\n        && pxsvc_log \"The repository pins its own toolchain (rust-toolchain); it takes precedence\"\n\n    pxsvc_ok \"$(cargo --version 2>/dev/null) · $(rustc --version 2>/dev/null)\"\n}\n\npxsvc_build() {\n    if ! pxsvc_bool \"${BUILD_ON_BOOT}\"; then\n        pxsvc_log \"BUILD_ON_BOOT disabled: skipping compilation\"\n        return 0\n    fi\n    if [ ! -f Cargo.toml ]; then\n        pxsvc_warn \"No Cargo.toml in /home/container; skipping compilation\"\n        return 0\n    fi\n\n    pxsvc_step \"Building project (profile: ${BUILD_PROFILE:-release})\"\n\n    local -a args=(build)\n    [ \"${BUILD_PROFILE}\" != \"debug\" ] && args+=(--release)\n    [ -n \"${CARGO_BIN}\" ]      && args+=(--bin \"${CARGO_BIN}\")\n    [ -n \"${CARGO_FEATURES}\" ] && args+=(--features \"${CARGO_FEATURES}\")\n    [ -n \"${RUST_TARGET}\" ]    && args+=(--target \"${RUST_TARGET}\")\n    # shellcheck disable=SC2206\n    [ -n \"${CARGO_FLAGS}\" ]    && args+=(${CARGO_FLAGS})\n\n    local start=${SECONDS}\n    echo -e \"${C_DIM}container@pterodactyl:~$ cargo ${args[*]}${C_RESET}\"\n    cargo \"${args[@]}\"\n    local rc=$?\n\n    if [ ${rc} -ne 0 ]; then\n        pxsvc_err \"Build failed (exit code ${rc})\"\n        pxsvc_err \"Check the cargo output above. The server will stop.\"\n        exit ${rc}\n    fi\n    pxsvc_ok \"Build finished in $((SECONDS - start))s\"\n}\nPXSVC_EOF_RUST\n\ncat > /mnt/server/.pxsvc/lib/cloudflare.sh <<'PXSVC_EOF_CF'\n#!/bin/bash\n# ============================================================\n#  pxsvc :: cloudflare.sh  ·  reverse proxy via Cloudflare Tunnel\n#  Modes: quick (temporary URL) · token (dashboard token)\n#         named (interactive login + tunnel and DNS creation)\n# ============================================================\n\nPXSVC_CF_DIR=\"/home/container/.cloudflared\"\nPXSVC_CF_LOG=\"/home/container/.pxsvc/logs/cloudflared.log\"\n\npxsvc_cf_bin() {\n    if [ -x \"${PXSVC_DIR}/bin/cloudflared\" ]; then\n        PXSVC_CFD=\"${PXSVC_DIR}/bin/cloudflared\"; return 0\n    fi\n    if command -v cloudflared >/dev/null 2>&1; then\n        PXSVC_CFD=\"$(command -v cloudflared)\"; return 0\n    fi\n\n    pxsvc_log \"Downloading cloudflared...\"\n    local arch\n    case \"$(uname -m)\" in\n        x86_64|amd64) arch=\"amd64\" ;;\n        aarch64|arm64) arch=\"arm64\" ;;\n        armv7l|armhf) arch=\"arm\" ;;\n        *) arch=\"amd64\" ;;\n    esac\n    mkdir -p \"${PXSVC_DIR}/bin\"\n    if curl -fsSL -o \"${PXSVC_DIR}/bin/cloudflared\" \\\n        \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}\"; then\n        chmod +x \"${PXSVC_DIR}/bin/cloudflared\"\n        PXSVC_CFD=\"${PXSVC_DIR}/bin/cloudflared\"\n        return 0\n    fi\n    return 1\n}\n\npxsvc_cf_tail() {\n    ( tail -n 0 -F \"${PXSVC_CF_LOG}\" 2>/dev/null \\\n        | while IFS= read -r line; do echo -e \"${C_DIM}[cloudflared]${C_RESET} ${line}\"; done ) &\n}\n\npxsvc_cf_box() {\n    echo \"\"\n    echo -e \"${C_GREEN}  ══════════════════════════════════════════════════════${C_RESET}\"\n    echo -e \"   $1\"\n    echo -e \"   ${C_B}${C_GREEN}$2${C_RESET}\"\n    echo -e \"${C_GREEN}  ══════════════════════════════════════════════════════${C_RESET}\"\n    echo \"\"\n}\n\npxsvc_cf_start() {\n    local mode=\"${CF_MODE:-off}\"\n    if ! pxsvc_bool \"${CF_ENABLED}\" || [ \"${mode}\" = \"off\" ]; then\n        pxsvc_log \"Cloudflare Tunnel disabled\"\n        return 0\n    fi\n\n    pxsvc_step \"Cloudflare Tunnel · ${mode} mode\"\n\n    if ! pxsvc_cf_bin; then\n        pxsvc_err \"Could not obtain the cloudflared binary; the service will start without a tunnel\"\n        return 1\n    fi\n\n    mkdir -p \"${PXSVC_CF_DIR}\" \"$(dirname \"${PXSVC_CF_LOG}\")\"\n    chmod 700 \"${PXSVC_CF_DIR}\" 2>/dev/null\n    : > \"${PXSVC_CF_LOG}\"\n    export TUNNEL_ORIGIN_CERT=\"${PXSVC_CF_DIR}/cert.pem\"\n\n    local svc=\"${CF_SERVICE_URL:-http://127.0.0.1:${SERVER_PORT}}\"\n    local -a globals=(--no-autoupdate --loglevel \"${CF_LOGLEVEL:-info}\" --logfile \"${PXSVC_CF_LOG}\")\n    local -a runflags=()\n    if [ -n \"${CF_PROTOCOL}\" ] && [ \"${CF_PROTOCOL}\" != \"auto\" ]; then\n        runflags+=(--protocol \"${CF_PROTOCOL}\")\n    fi\n\n    case \"${mode}\" in\n        quick)   pxsvc_cf_quick \"${svc}\" ;;\n        token)   pxsvc_cf_token ;;\n        named)   pxsvc_cf_named \"${svc}\" ;;\n        *)       pxsvc_err \"Unknown CF_MODE: ${mode}\"; return 1 ;;\n    esac\n}\n\n# ---------- MODE 1: quick tunnel (*.trycloudflare.com URL) ----------\npxsvc_cf_quick() {\n    local svc=\"$1\"\n    pxsvc_log \"Creating a temporary tunnel to ${svc}\"\n    \"${PXSVC_CFD}\" \"${globals[@]}\" tunnel \"${runflags[@]}\" --url \"${svc}\" >/dev/null 2>&1 &\n    PXSVC_CF_PID=$!\n    pxsvc_cf_tail\n\n    local url=\"\" i\n    for i in $(seq 1 30); do\n        url=\"$(grep -oE 'https://[-a-z0-9]+\\.trycloudflare\\.com' \"${PXSVC_CF_LOG}\" 2>/dev/null | head -n1)\"\n        [ -n \"${url}\" ] && break\n        sleep 1\n    done\n\n    if [ -n \"${url}\" ]; then\n        pxsvc_cf_box \"Your service is published at:\" \"${url}\"\n        echo \"${url}\" > \"${PXSVC_DIR}/logs/tunnel-url.txt\"\n    else\n        pxsvc_warn \"The temporary URL is not available yet; check the cloudflared log\"\n    fi\n}\n\n# ---------- MODE 2: dashboard token (recommended for production) ----------\npxsvc_cf_token() {\n    if [ -z \"${CF_TOKEN}\" ]; then\n        pxsvc_err \"CF_MODE=token but CF_TOKEN is empty.\"\n        pxsvc_err \"Create it at: Cloudflare Zero Trust -> Networks -> Tunnels -> Create a tunnel -> copy the token.\"\n        return 1\n    fi\n    pxsvc_log \"Connecting the dashboard-managed tunnel\"\n    \"${PXSVC_CFD}\" \"${globals[@]}\" tunnel run \"${runflags[@]}\" --token \"${CF_TOKEN}\" >/dev/null 2>&1 &\n    PXSVC_CF_PID=$!\n    pxsvc_cf_tail\n    [ -n \"${CF_HOSTNAME}\" ] && pxsvc_cf_box \"Public (per the dashboard ingress rules):\" \"https://${CF_HOSTNAME}\"\n    pxsvc_ok \"Tunnel started (PID ${PXSVC_CF_PID})\"\n}\n\n# ---------- MODE 3: interactive login + named tunnel + DNS ----------\npxsvc_cf_named() {\n    local svc=\"$1\"\n    local name=\"${CF_TUNNEL_NAME:-pxsvc-${P_SERVER_UUID:0:8}}\"\n\n    if [ ! -f \"${TUNNEL_ORIGIN_CERT}\" ]; then\n        pxsvc_warn \"No saved Cloudflare session. Starting authentication...\"\n        pxsvc_log \"1) Copy the URL printed below and open it in your browser\"\n        pxsvc_log \"2) Log in and authorize the domain you want to use\"\n        pxsvc_log \"3) Startup will continue automatically once you are done\"\n        \"${PXSVC_CFD}\" tunnel login\n        if [ ! -f \"${TUNNEL_ORIGIN_CERT}\" ]; then\n            pxsvc_err \"Login was not completed (no cert.pem generated). Restart the server to try again.\"\n            return 1\n        fi\n        pxsvc_ok \"Session saved to .cloudflared/cert.pem\"\n    fi\n\n    if ! \"${PXSVC_CFD}\" tunnel info \"${name}\" >/dev/null 2>&1; then\n        pxsvc_log \"Creating tunnel '${name}'\"\n        \"${PXSVC_CFD}\" tunnel create \"${name}\" || { pxsvc_err \"Could not create the tunnel\"; return 1; }\n    else\n        pxsvc_log \"Reusing existing tunnel '${name}'\"\n    fi\n\n    local cred\n    cred=\"$(ls -t \"${PXSVC_CF_DIR}\"/*.json 2>/dev/null | head -n1)\"\n\n    {\n        echo \"tunnel: ${name}\"\n        [ -n \"${cred}\" ] && echo \"credentials-file: ${cred}\"\n        echo \"ingress:\"\n        if [ -n \"${CF_HOSTNAME}\" ]; then\n            echo \"  - hostname: ${CF_HOSTNAME}\"\n            echo \"    service: ${svc}\"\n            echo \"  - service: http_status:404\"\n        else\n            echo \"  - service: ${svc}\"\n        fi\n    } > \"${PXSVC_CF_DIR}/config.yml\"\n\n    if [ -n \"${CF_HOSTNAME}\" ]; then\n        pxsvc_log \"Registering DNS ${CF_HOSTNAME} -> ${name}\"\n        \"${PXSVC_CFD}\" tunnel route dns --overwrite-dns \"${name}\" \"${CF_HOSTNAME}\" >/dev/null 2>&1 \\\n            || \"${PXSVC_CFD}\" tunnel route dns \"${name}\" \"${CF_HOSTNAME}\" >/dev/null 2>&1 \\\n            || pxsvc_warn \"Could not create the DNS record (does it already point somewhere else?)\"\n    fi\n\n    # Reusable token: written to disk, never printed in full to the console\n    local tok\n    tok=\"$(\"${PXSVC_CFD}\" tunnel token \"${name}\" 2>/dev/null | tr -d '\\r\\n')\"\n    if [ -n \"${tok}\" ]; then\n        printf '%s' \"${tok}\" > \"${PXSVC_CF_DIR}/token.txt\"\n        chmod 600 \"${PXSVC_CF_DIR}/token.txt\" 2>/dev/null\n        pxsvc_ok \"Token generated and saved to .cloudflared/token.txt (${tok:0:6}...${tok: -6})\"\n        pxsvc_log \"Download it from the file manager and paste it into CF_TOKEN + CF_MODE=token for login-free startups.\"\n    fi\n\n    \"${PXSVC_CFD}\" \"${globals[@]}\" --config \"${PXSVC_CF_DIR}/config.yml\" tunnel run \"${runflags[@]}\" \"${name}\" >/dev/null 2>&1 &\n    PXSVC_CF_PID=$!\n    pxsvc_cf_tail\n    [ -n \"${CF_HOSTNAME}\" ] && pxsvc_cf_box \"Your service is published at:\" \"https://${CF_HOSTNAME}\"\n    pxsvc_ok \"Tunnel '${name}' started (PID ${PXSVC_CF_PID})\"\n}\nPXSVC_EOF_CF\n\nchmod +x /mnt/server/.pxsvc/entrypoint.sh /mnt/server/.pxsvc/lib/*.sh\n\n# ---------------------------------------------------------------------\n# 2. cloudflared\n# ---------------------------------------------------------------------\ncase \"$(uname -m)\" in\n    x86_64|amd64) CF_ARCH=\"amd64\" ;;\n    aarch64|arm64) CF_ARCH=\"arm64\" ;;\n    armv7l|armhf) CF_ARCH=\"arm\" ;;\n    *) CF_ARCH=\"amd64\" ;;\nesac\necho \"==> Downloading cloudflared (${CF_ARCH})\"\nif curl -fsSL -o /mnt/server/.pxsvc/bin/cloudflared \\\n    \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}\"; then\n    chmod +x /mnt/server/.pxsvc/bin/cloudflared\n    echo \"    cloudflared $(/mnt/server/.pxsvc/bin/cloudflared --version 2>/dev/null | head -n1)\"\nelse\n    echo \"    [warning] cloudflared could not be downloaded; it will be retried on first boot\"\nfi\n\n# ---------------------------------------------------------------------\n# 3. Source code\n# ---------------------------------------------------------------------\nif [ -n \"${GIT_REPO}\" ]; then\n    BRANCH=\"${GIT_BRANCH:-main}\"\n    AUTH_URL=\"${GIT_REPO}\"\n    if [ -n \"${GIT_USER}\" ] && [ -n \"${GIT_TOKEN}\" ]; then\n        AUTH_URL=$(echo \"${GIT_REPO}\" | sed -E \"s#^(https?://)#\\1${GIT_USER}:${GIT_TOKEN}@#\")\n    elif [ -n \"${GIT_TOKEN}\" ]; then\n        AUTH_URL=$(echo \"${GIT_REPO}\" | sed -E \"s#^(https?://)#\\1oauth2:${GIT_TOKEN}@#\")\n    fi\n    export GIT_TERMINAL_PROMPT=0\n    git config --global --add safe.directory /mnt/server >/dev/null 2>&1\n    echo \"==> Fetching ${GIT_REPO} (branch ${BRANCH})\"\n    if [ ! -d /mnt/server/.git ]; then\n        git init -q /mnt/server\n        git -C /mnt/server remote add origin \"${AUTH_URL}\" 2>/dev/null \\\n            || git -C /mnt/server remote set-url origin \"${AUTH_URL}\"\n    else\n        git -C /mnt/server remote set-url origin \"${AUTH_URL}\"\n    fi\n    if git -C /mnt/server fetch --depth 1 origin \"${BRANCH}\"; then\n        git -C /mnt/server checkout -f -B \"${BRANCH}\" FETCH_HEAD >/dev/null 2>&1\n        [ -f /mnt/server/.gitmodules ] && git -C /mnt/server submodule update --init --recursive --depth 1 >/dev/null 2>&1\n        echo \"    OK: $(git -C /mnt/server log -1 --pretty='%h %s' 2>/dev/null)\"\n    else\n        echo \"    [warning] could not fetch the repository (URL/branch/token?)\"\n    fi\n    git -C /mnt/server remote set-url origin \"${GIT_REPO}\" 2>/dev/null\nelse\n    echo \"==> GIT_REPO is empty: upload your project through the file manager\"\n    if [ ! -f /mnt/server/Cargo.toml ]; then\n        mkdir -p /mnt/server/src\n        cat > /mnt/server/Cargo.toml <<'PXSVC_EOF_CARGO'\n[package]\nname = \"my-service\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nPXSVC_EOF_CARGO\n        cat > /mnt/server/src/main.rs <<'PXSVC_EOF_MAIN'\nuse std::io::{Read, Write};\nuse std::net::TcpListener;\n\nfn main() -> std::io::Result<()> {\n    let port = std::env::var(\"SERVER_PORT\").unwrap_or_else(|_| \"8080\".into());\n    let addr = format!(\"0.0.0.0:{port}\");\n    let listener = TcpListener::bind(&addr)?;\n    println!(\"Example service listening on http://{addr}\");\n\n    for stream in listener.incoming() {\n        let mut stream = stream?;\n        let mut buf = [0u8; 1024];\n        let _ = stream.read(&mut buf);\n        let body = \"Rust Service Egg: everything works.\";\n        let resp = format!(\n            \"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain; charset=utf-8\\r\\nContent-Length: {}\\r\\nConnection: close\\r\\n\\r\\n{}\",\n            body.len(),\n            body\n        );\n        let _ = stream.write_all(resp.as_bytes());\n    }\n    Ok(())\n}\nPXSVC_EOF_MAIN\n        echo \"    Example project created (Cargo.toml + src/main.rs)\"\n    fi\nfi\n\n# ---------------------------------------------------------------------\n# 4. Optional rustup inside the server volume\n# ---------------------------------------------------------------------\nif [ \"${INSTALL_RUSTUP}\" = \"1\" ] || [ \"${INSTALL_RUSTUP}\" = \"true\" ]; then\n    echo \"==> Installing rustup into the server volume\"\n    export RUSTUP_HOME=/mnt/server/.rustup\n    export CARGO_HOME=/mnt/server/.cargo\n    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\\n        | sh -s -- -y --no-modify-path --profile minimal \\\n                  --default-toolchain \"${RUST_TOOLCHAIN:-stable}\" \\\n        || echo \"    [warning] rustup installation failed\"\nfi\n\nmkdir -p /mnt/server/.cargo\n[ -f /mnt/server/.cargo/config.toml ] || cat > /mnt/server/.cargo/config.toml <<'PXSVC_EOF_CARGOCFG'\n[net]\nretry = 3\n\n[term]\ncolor = \"always\"\nPXSVC_EOF_CARGOCFG\n\necho \"\"\necho \"================================================\"\necho \"  Installation complete\"\necho \"  Runtime : /home/container/.pxsvc\"\necho \"  Startup : bash .pxsvc/entrypoint.sh\"\necho \"================================================\"\n",
+            "container": "ghcr.io/parkervcp/installers:debian",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Git repository",
+            "description": "HTTPS URL of the Rust project repository. Leave empty if you will upload the code manually through the file manager.",
+            "env_variable": "GIT_REPO",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Branch",
+            "description": "Branch or tag to deploy. Defaults to main.",
+            "env_variable": "GIT_BRANCH",
+            "default_value": "main",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Git username",
+            "description": "Username for private repositories. Leave empty for public repos.",
+            "env_variable": "GIT_USER",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Git token",
+            "description": "Personal Access Token for private repositories. It is only used during the fetch and is never stored in .git/config.",
+            "env_variable": "GIT_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Update on boot",
+            "description": "1 = run git fetch + reset to the branch on every boot. 0 = use the local code as-is.",
+            "env_variable": "AUTO_UPDATE",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Install rustup during installation",
+            "description": "1 = install rustup inside the server volume at install time (useful when the image has no Rust). 0 = use the Rust from the Docker image.",
+            "env_variable": "INSTALL_RUSTUP",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Rust toolchain",
+            "description": "stable, beta, nightly or an exact version (1.85.0). Use 'default' to leave the image toolchain untouched.",
+            "env_variable": "RUST_TOOLCHAIN",
+            "default_value": "stable",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "Build target",
+            "description": "Optional target triple, e.g. x86_64-unknown-linux-musl. Empty = native target.",
+            "env_variable": "RUST_TARGET",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Build on boot",
+            "description": "1 = run cargo build on every boot. 0 = start the already compiled binary directly.",
+            "env_variable": "BUILD_ON_BOOT",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Build profile",
+            "description": "release (optimized) or debug (builds faster, slower binary).",
+            "env_variable": "BUILD_PROFILE",
+            "default_value": "release",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:release,debug",
+            "field_type": "text"
+        },
+        {
+            "name": "Cargo binary (--bin)",
+            "description": "Name of the binary to build when the project or workspace has several. Empty = default.",
+            "env_variable": "CARGO_BIN",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Features",
+            "description": "Comma-separated feature list passed to --features.",
+            "env_variable": "CARGO_FEATURES",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Extra cargo flags",
+            "description": "Additional arguments for cargo build, e.g. --locked --no-default-features.",
+            "env_variable": "CARGO_FLAGS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Binary name",
+            "description": "Executable name inside target/<profile>/. Empty = auto-detected from Cargo.toml.",
+            "env_variable": "BINARY_NAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Application arguments",
+            "description": "Arguments passed to your binary. Environment variables are supported: --port ${SERVER_PORT} --bind ${BIND_ADDR}",
+            "env_variable": "APP_ARGS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        },
+        {
+            "name": "Custom startup command",
+            "description": "Fully overrides the final command. It runs through bash, so it supports variables (${SERVER_PORT}, ${SERVER_MEMORY}, ${PXSVC_BIN}) and pipes. Example: ${PXSVC_BIN} serve --port ${SERVER_PORT}",
+            "env_variable": "CUSTOM_STARTUP",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        },
+        {
+            "name": "Extra environment variables",
+            "description": "KEY=value pairs separated by ';'. Example: DATABASE_URL=postgres://...;APP_ENV=production",
+            "env_variable": "ENV_VARS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "RUST_LOG",
+            "description": "Log level for the log/tracing crates: error, warn, info, debug, trace, or per-module filters.",
+            "env_variable": "RUST_LOG",
+            "default_value": "info",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "RUST_BACKTRACE",
+            "description": "0 = no backtrace, 1 = backtrace, full = full backtrace on panics.",
+            "env_variable": "RUST_BACKTRACE",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:0,1,full",
+            "field_type": "text"
+        },
+        {
+            "name": "Enable Cloudflare Tunnel",
+            "description": "1 = publish the service on the internet through Cloudflare Tunnel (no open ports, node IP stays hidden).",
+            "env_variable": "CF_ENABLED",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel mode",
+            "description": "off - quick (temporary *.trycloudflare.com URL, no account needed) - token (paste the dashboard token) - named (browser login, creates the tunnel and DNS record and generates your token).",
+            "env_variable": "CF_MODE",
+            "default_value": "off",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:off,quick,token,named",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel token",
+            "description": "Token from Zero Trust -> Networks -> Tunnels. Only used when CF_MODE=token.",
+            "env_variable": "CF_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": true,
+            "rules": "nullable|string|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel name",
+            "description": "Tunnel name used by CF_MODE=named. Empty = generated from the server UUID.",
+            "env_variable": "CF_TUNNEL_NAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Public hostname",
+            "description": "Subdomain that will point to the service, e.g. api.mydomain.com. In named mode the DNS record is created automatically.",
+            "env_variable": "CF_HOSTNAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Local service",
+            "description": "Internal tunnel destination. Empty = http://127.0.0.1:${SERVER_PORT}. Use tcp://127.0.0.1:PORT for non-HTTP services.",
+            "env_variable": "CF_SERVICE_URL",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel protocol",
+            "description": "auto, http2 or quic. Use http2 if the node blocks UDP/7844.",
+            "env_variable": "CF_PROTOCOL",
+            "default_value": "auto",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:auto,http2,quic",
+            "field_type": "text"
+        }
+    ]
+}

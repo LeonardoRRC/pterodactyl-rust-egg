@@ -1,0 +1,305 @@
+{
+    "_comment": "Rust Service Egg (remote runtime) - the install script downloads runtime/ from GitHub. Update RUNTIME_URL to point at your repository.",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-07-23T01:28:27+00:00",
+    "name": "Rust Service (Cargo + Cloudflare Tunnel) [remote runtime]",
+    "author": "quantum@thequantum.uk",
+    "description": "Host and build services written in Rust. Syncs the source from Git, manages the toolchain with rustup, builds with cargo (configurable profile, features, target and flags), allows a fully custom startup command, and ships a Cloudflare Tunnel reverse proxy with three modes: temporary URL, dashboard token, or interactive login that creates the tunnel, the DNS record and the access token. The runtime scripts are fetched from GitHub at install time.",
+    "features": null,
+    "docker_images": {
+        "Rust - custom image (recommended)": "ghcr.io/LeonardoRRC/pterodactyl-rust-service:latest",
+        "Rust latest (yolks)": "ghcr.io/parkervcp/yolks:rust_latest",
+        "Rust 1.85 (yolks)": "ghcr.io/parkervcp/yolks:rust_1.85",
+        "Debian (run pre-compiled binaries only)": "ghcr.io/parkervcp/yolks:debian"
+    },
+    "file_denylist": [],
+    "startup": "bash .pxsvc/entrypoint.sh",
+    "config": {
+        "files": "{}",
+        "startup": "{\"done\": [\"[pxsvc] service is running\"], \"strip_ansi\": false}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\n# =====================================================================\n#  Rust Service · Pterodactyl install script (remote runtime)\n#  Container: ghcr.io/parkervcp/installers:debian\n#  The runtime scripts are downloaded from RUNTIME_URL, so updating the\n#  repository and reinstalling the server is enough to ship a new version.\n# =====================================================================\n\napt-get update -y >/dev/null 2>&1\napt-get install -y --no-install-recommends \\\n    ca-certificates curl wget git jq tar unzip xz-utils file >/dev/null 2>&1\n\nexport HOME=/mnt/server\nmkdir -p /mnt/server/.pxsvc/bin /mnt/server/.pxsvc/lib /mnt/server/.pxsvc/logs\ncd /mnt/server || exit 1\n\n# ---------------------------------------------------------------------\n# 1. Runtime scripts (downloaded)\n# ---------------------------------------------------------------------\nRUNTIME_URL=\"${RUNTIME_URL:-https://raw.githubusercontent.com/LeonardoRRC/pterodactyl-rust-service/main/runtime}\"\nRUNTIME_URL=\"${RUNTIME_URL%/}\"\n\necho \"==> Downloading the pxsvc runtime\"\necho \"    source: ${RUNTIME_URL}\"\n\npxsvc_fetch() {\n    # $1 = path relative to RUNTIME_URL, $2 = destination\n    if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o \"$2\" \"${RUNTIME_URL}/$1\"; then\n        echo \"    [ERROR] could not download $1\"\n        echo \"            check RUNTIME_URL, that the repository is public and that the file exists\"\n        return 1\n    fi\n    # A 404 page or a truncated download would not be valid bash\n    if ! bash -n \"$2\" 2>/dev/null; then\n        echo \"    [ERROR] $1 downloaded but is not a valid script (private repo? wrong URL?)\"\n        return 1\n    fi\n    echo \"    ok  $1\"\n    return 0\n}\n\npxsvc_fetch \"entrypoint.sh\"      \"/mnt/server/.pxsvc/entrypoint.sh\"      || exit 1\npxsvc_fetch \"lib/common.sh\"      \"/mnt/server/.pxsvc/lib/common.sh\"      || exit 1\npxsvc_fetch \"lib/git.sh\"         \"/mnt/server/.pxsvc/lib/git.sh\"         || exit 1\npxsvc_fetch \"lib/rust.sh\"        \"/mnt/server/.pxsvc/lib/rust.sh\"        || exit 1\npxsvc_fetch \"lib/cloudflare.sh\"  \"/mnt/server/.pxsvc/lib/cloudflare.sh\"  || exit 1\n\nchmod +x /mnt/server/.pxsvc/entrypoint.sh /mnt/server/.pxsvc/lib/*.sh\n\n# ---------------------------------------------------------------------\n# 2. cloudflared\n# ---------------------------------------------------------------------\ncase \"$(uname -m)\" in\n    x86_64|amd64) CF_ARCH=\"amd64\" ;;\n    aarch64|arm64) CF_ARCH=\"arm64\" ;;\n    armv7l|armhf) CF_ARCH=\"arm\" ;;\n    *) CF_ARCH=\"amd64\" ;;\nesac\necho \"==> Downloading cloudflared (${CF_ARCH})\"\nif curl -fsSL -o /mnt/server/.pxsvc/bin/cloudflared \\\n    \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}\"; then\n    chmod +x /mnt/server/.pxsvc/bin/cloudflared\n    echo \"    cloudflared $(/mnt/server/.pxsvc/bin/cloudflared --version 2>/dev/null | head -n1)\"\nelse\n    echo \"    [warning] cloudflared could not be downloaded; it will be retried on first boot\"\nfi\n\n# ---------------------------------------------------------------------\n# 3. Source code\n# ---------------------------------------------------------------------\nif [ -n \"${GIT_REPO}\" ]; then\n    BRANCH=\"${GIT_BRANCH:-main}\"\n    AUTH_URL=\"${GIT_REPO}\"\n    if [ -n \"${GIT_USER}\" ] && [ -n \"${GIT_TOKEN}\" ]; then\n        AUTH_URL=$(echo \"${GIT_REPO}\" | sed -E \"s#^(https?://)#\\1${GIT_USER}:${GIT_TOKEN}@#\")\n    elif [ -n \"${GIT_TOKEN}\" ]; then\n        AUTH_URL=$(echo \"${GIT_REPO}\" | sed -E \"s#^(https?://)#\\1oauth2:${GIT_TOKEN}@#\")\n    fi\n    export GIT_TERMINAL_PROMPT=0\n    git config --global --add safe.directory /mnt/server >/dev/null 2>&1\n    echo \"==> Fetching ${GIT_REPO} (branch ${BRANCH})\"\n    if [ ! -d /mnt/server/.git ]; then\n        git init -q /mnt/server\n        git -C /mnt/server remote add origin \"${AUTH_URL}\" 2>/dev/null \\\n            || git -C /mnt/server remote set-url origin \"${AUTH_URL}\"\n    else\n        git -C /mnt/server remote set-url origin \"${AUTH_URL}\"\n    fi\n    if git -C /mnt/server fetch --depth 1 origin \"${BRANCH}\"; then\n        git -C /mnt/server checkout -f -B \"${BRANCH}\" FETCH_HEAD >/dev/null 2>&1\n        [ -f /mnt/server/.gitmodules ] && git -C /mnt/server submodule update --init --recursive --depth 1 >/dev/null 2>&1\n        echo \"    OK: $(git -C /mnt/server log -1 --pretty='%h %s' 2>/dev/null)\"\n    else\n        echo \"    [warning] could not fetch the repository (URL/branch/token?)\"\n    fi\n    git -C /mnt/server remote set-url origin \"${GIT_REPO}\" 2>/dev/null\nelse\n    echo \"==> GIT_REPO is empty: upload your project through the file manager\"\n    if [ ! -f /mnt/server/Cargo.toml ]; then\n        mkdir -p /mnt/server/src\n        cat > /mnt/server/Cargo.toml <<'PXSVC_EOF_CARGO'\n[package]\nname = \"my-service\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nPXSVC_EOF_CARGO\n        cat > /mnt/server/src/main.rs <<'PXSVC_EOF_MAIN'\nuse std::io::{Read, Write};\nuse std::net::TcpListener;\n\nfn main() -> std::io::Result<()> {\n    let port = std::env::var(\"SERVER_PORT\").unwrap_or_else(|_| \"8080\".into());\n    let addr = format!(\"0.0.0.0:{port}\");\n    let listener = TcpListener::bind(&addr)?;\n    println!(\"Example service listening on http://{addr}\");\n\n    for stream in listener.incoming() {\n        let mut stream = stream?;\n        let mut buf = [0u8; 1024];\n        let _ = stream.read(&mut buf);\n        let body = \"Rust Service Egg: everything works.\";\n        let resp = format!(\n            \"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain; charset=utf-8\\r\\nContent-Length: {}\\r\\nConnection: close\\r\\n\\r\\n{}\",\n            body.len(),\n            body\n        );\n        let _ = stream.write_all(resp.as_bytes());\n    }\n    Ok(())\n}\nPXSVC_EOF_MAIN\n        echo \"    Example project created (Cargo.toml + src/main.rs)\"\n    fi\nfi\n\n# ---------------------------------------------------------------------\n# 4. Optional rustup inside the server volume\n# ---------------------------------------------------------------------\nif [ \"${INSTALL_RUSTUP}\" = \"1\" ] || [ \"${INSTALL_RUSTUP}\" = \"true\" ]; then\n    echo \"==> Installing rustup into the server volume\"\n    export RUSTUP_HOME=/mnt/server/.rustup\n    export CARGO_HOME=/mnt/server/.cargo\n    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\\n        | sh -s -- -y --no-modify-path --profile minimal \\\n                  --default-toolchain \"${RUST_TOOLCHAIN:-stable}\" \\\n        || echo \"    [warning] rustup installation failed\"\nfi\n\nmkdir -p /mnt/server/.cargo\n[ -f /mnt/server/.cargo/config.toml ] || cat > /mnt/server/.cargo/config.toml <<'PXSVC_EOF_CARGOCFG'\n[net]\nretry = 3\n\n[term]\ncolor = \"always\"\nPXSVC_EOF_CARGOCFG\n\necho \"\"\necho \"================================================\"\necho \"  Installation complete\"\necho \"  Runtime : /home/container/.pxsvc\"\necho \"  Startup : bash .pxsvc/entrypoint.sh\"\necho \"================================================\"\n",
+            "container": "ghcr.io/parkervcp/installers:debian",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Runtime source URL",
+            "description": "Base URL the install script downloads the pxsvc runtime from. Point it at a tag instead of main to pin a version. Admin only.",
+            "env_variable": "RUNTIME_URL",
+            "default_value": "https://raw.githubusercontent.com/LeonardoRRC/pterodactyl-rust-service/main/runtime",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Git repository",
+            "description": "HTTPS URL of the Rust project repository. Leave empty if you will upload the code manually through the file manager.",
+            "env_variable": "GIT_REPO",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Branch",
+            "description": "Branch or tag to deploy. Defaults to main.",
+            "env_variable": "GIT_BRANCH",
+            "default_value": "main",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Git username",
+            "description": "Username for private repositories. Leave empty for public repos.",
+            "env_variable": "GIT_USER",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Git token",
+            "description": "Personal Access Token for private repositories. It is only used during the fetch and is never stored in .git/config.",
+            "env_variable": "GIT_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Update on boot",
+            "description": "1 = run git fetch + reset to the branch on every boot. 0 = use the local code as-is.",
+            "env_variable": "AUTO_UPDATE",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Install rustup during installation",
+            "description": "1 = install rustup inside the server volume at install time (useful when the image has no Rust). 0 = use the Rust from the Docker image.",
+            "env_variable": "INSTALL_RUSTUP",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Rust toolchain",
+            "description": "stable, beta, nightly or an exact version (1.85.0). Use 'default' to leave the image toolchain untouched.",
+            "env_variable": "RUST_TOOLCHAIN",
+            "default_value": "stable",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "Build target",
+            "description": "Optional target triple, e.g. x86_64-unknown-linux-musl. Empty = native target.",
+            "env_variable": "RUST_TARGET",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Build on boot",
+            "description": "1 = run cargo build on every boot. 0 = start the already compiled binary directly.",
+            "env_variable": "BUILD_ON_BOOT",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Build profile",
+            "description": "release (optimized) or debug (builds faster, slower binary).",
+            "env_variable": "BUILD_PROFILE",
+            "default_value": "release",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:release,debug",
+            "field_type": "text"
+        },
+        {
+            "name": "Cargo binary (--bin)",
+            "description": "Name of the binary to build when the project or workspace has several. Empty = default.",
+            "env_variable": "CARGO_BIN",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Features",
+            "description": "Comma-separated feature list passed to --features.",
+            "env_variable": "CARGO_FEATURES",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Extra cargo flags",
+            "description": "Additional arguments for cargo build, e.g. --locked --no-default-features.",
+            "env_variable": "CARGO_FLAGS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Binary name",
+            "description": "Executable name inside target/<profile>/. Empty = auto-detected from Cargo.toml.",
+            "env_variable": "BINARY_NAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Application arguments",
+            "description": "Arguments passed to your binary. Environment variables are supported: --port ${SERVER_PORT} --bind ${BIND_ADDR}",
+            "env_variable": "APP_ARGS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        },
+        {
+            "name": "Custom startup command",
+            "description": "Fully overrides the final command. It runs through bash, so it supports variables (${SERVER_PORT}, ${SERVER_MEMORY}, ${PXSVC_BIN}) and pipes. Example: ${PXSVC_BIN} serve --port ${SERVER_PORT}",
+            "env_variable": "CUSTOM_STARTUP",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        },
+        {
+            "name": "Extra environment variables",
+            "description": "KEY=value pairs separated by ';'. Example: DATABASE_URL=postgres://...;APP_ENV=production",
+            "env_variable": "ENV_VARS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "RUST_LOG",
+            "description": "Log level for the log/tracing crates: error, warn, info, debug, trace, or per-module filters.",
+            "env_variable": "RUST_LOG",
+            "default_value": "info",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "RUST_BACKTRACE",
+            "description": "0 = no backtrace, 1 = backtrace, full = full backtrace on panics.",
+            "env_variable": "RUST_BACKTRACE",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:0,1,full",
+            "field_type": "text"
+        },
+        {
+            "name": "Enable Cloudflare Tunnel",
+            "description": "1 = publish the service on the internet through Cloudflare Tunnel (no open ports, node IP stays hidden).",
+            "env_variable": "CF_ENABLED",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel mode",
+            "description": "off - quick (temporary *.trycloudflare.com URL, no account needed) - token (paste the dashboard token) - named (browser login, creates the tunnel and DNS record and generates your token).",
+            "env_variable": "CF_MODE",
+            "default_value": "off",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:off,quick,token,named",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel token",
+            "description": "Token from Zero Trust -> Networks -> Tunnels. Only used when CF_MODE=token.",
+            "env_variable": "CF_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": true,
+            "rules": "nullable|string|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel name",
+            "description": "Tunnel name used by CF_MODE=named. Empty = generated from the server UUID.",
+            "env_variable": "CF_TUNNEL_NAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Public hostname",
+            "description": "Subdomain that will point to the service, e.g. api.mydomain.com. In named mode the DNS record is created automatically.",
+            "env_variable": "CF_HOSTNAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Local service",
+            "description": "Internal tunnel destination. Empty = http://127.0.0.1:${SERVER_PORT}. Use tcp://127.0.0.1:PORT for non-HTTP services.",
+            "env_variable": "CF_SERVICE_URL",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Tunnel protocol",
+            "description": "auto, http2 or quic. Use http2 if the node blocks UDP/7844.",
+            "env_variable": "CF_PROTOCOL",
+            "default_value": "auto",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:auto,http2,quic",
+            "field_type": "text"
+        }
+    ]
+}

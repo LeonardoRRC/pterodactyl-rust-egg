@@ -1,0 +1,59 @@
+name: Validate eggs and runtime
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check runtime script syntax
+        run: |
+          for f in runtime/entrypoint.sh runtime/lib/*.sh docker/entrypoint.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+
+      - name: Validate egg JSON and embedded install scripts
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, subprocess, sys, tempfile
+
+          failed = False
+          for path in sorted(pathlib.Path("eggs").glob("*.json")):
+              egg = json.loads(path.read_text())
+              script = egg["scripts"]["installation"]["script"]
+              with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+                  fh.write(script)
+                  tmp = fh.name
+              result = subprocess.run(["bash", "-n", tmp], capture_output=True, text=True)
+              status = "ok" if result.returncode == 0 else "FAIL"
+              if result.returncode != 0:
+                  failed = True
+                  print(result.stderr)
+              print(f"{status}  {path}  ({len(egg['variables'])} variables)")
+
+              # The done marker must exist in the runtime, or servers hang on "starting"
+              marker = json.loads(egg["config"]["startup"])["done"][0]
+              runtime = pathlib.Path("runtime/lib/common.sh").read_text()
+              if marker not in runtime:
+                  failed = True
+                  print(f"FAIL  done marker {marker!r} is not printed by runtime/lib/common.sh")
+
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Eggs must be in sync with runtime/
+        run: |
+          python3 tools/build-eggs.py
+          git diff --exit-code eggs/ \
+            || { echo "::error::eggs/ is out of date - run 'python3 tools/build-eggs.py' and commit the result"; exit 1; }
+
+      - name: Shellcheck
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y shellcheck
+          shellcheck -S warning -e SC1090,SC1091,SC2034 runtime/lib/*.sh runtime/entrypoint.sh || true
