@@ -16,49 +16,6 @@ tools/build-eggs.py                <- regenerates both eggs from runtime/
 
 ---
 
-## 0. Publishing this repository
-
-```bash
-git init -b main
-git add .
-git commit -m "Rust service egg for Pterodactyl"
-git remote add origin https://github.com/YOUR_USER/pterodactyl-rust-service.git
-git push -u origin main
-```
-
-Then replace `LeonardoRRC` in three places:
-
-| File | What to change |
-|---|---|
-| `eggs/*.json` → `docker_images` | `ghcr.io/LeonardoRRC/...` → your GHCR user |
-| `eggs/egg-rust-service-remote.json` → `RUNTIME_URL` | your `raw.githubusercontent.com` path |
-| `LICENSE` | copyright holder |
-
-`git push` triggers **Build and publish image**, which builds `docker/Dockerfile` for
-amd64 and arm64 and pushes it to `ghcr.io/YOUR_USER/pterodactyl-rust-service:latest`.
-No secrets to configure: it uses the automatic `GITHUB_TOKEN`.
-
-> **The first push publishes a private package.** Wings cannot pull it until you go to
-> your profile → **Packages** → `pterodactyl-rust-service` → **Package settings** →
-> **Change visibility → Public**. Do this once; a private image fails with
-> `manifest unknown` or `unauthorized` on the node.
-
-Tag a release to pin a version: `git tag v1.0.0 && git push --tags` produces the
-`:v1.0.0` tag alongside `:latest`.
-
-The **Validate eggs and runtime** workflow checks the shell syntax of every script,
-verifies the `done` marker still exists in the runtime, and fails if `eggs/` is out of
-date with respect to `runtime/`.
-
-### After editing anything in `runtime/`
-
-```bash
-python3 tools/build-eggs.py   # re-embeds the scripts into eggs/*.json
-git commit -am "runtime: ..." && git push
-```
-
----
-
 ## 1. Which egg to import
 
 | | `embedded` | `remote` |
